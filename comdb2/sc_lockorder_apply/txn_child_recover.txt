@@ -1,0 +1,65 @@
+Running the test in a loop, the test periodically times-out.  The master
+corefile shows that a transaction is blocked in distributed commit.  The
+replicants are blocked, and complain that they are unable to apply a
+__txn_child_recover (it fails with a rcode of 5).
+
+After some instrumentation, the replicants produce a core with this walkback.
+The 5 rcode is coming from the txnlist_update rcode in this section:
+
+} else if (op == DB_TXN_OPENFILES) {
+    /*
+     * If we have a partial subtransaction, then the whole
+     * transaction should be ignored.
+     */
+    c_stat = __db_txnlist_find(dbenv, info, argp->child);
+    if (c_stat == TXN_NOTFOUND) {
+        p_stat =
+            __db_txnlist_find(dbenv, info, argp->txnid->txnid);
+        if (p_stat == TXN_NOTFOUND) {
+            ret = __db_txnlist_add(dbenv, info,
+                    argp->txnid->txnid, TXN_IGNORE, NULL);
+            fromline = __LINE__;
+        }
+        else {
+            ret = __db_txnlist_update(dbenv, info,
+                    argp->txnid->txnid, TXN_IGNORE, NULL);
+            fromline = __LINE__;
+        }
+    }
+}
+
+The code during openfiles attempts to identify transactions that it should
+attempt to REDO, and transactions it should UNDO.  We know if we should REDO
+a transaction if the logstream contains both the begin-record and the commit-
+-record.  For completeness, we know that we should UNDO a transaction if we
+see only the BEGIN record.
+
+For the REDO case, we need to find the oldest begin record for ALL PARTS OF
+THE TRANSACTION.  That is, if we can't find the begin record of any committed-
+child, the entire transaction (parent and all children) should be ignored.
+The update case says, "we have found a parent transaction, and we wish to 
+make sure that it is not REDONE".
+
+So the bug is related to the return-codes of __db_txnlist_update- this part:
+
+    ret = __db_txnlist_find_internal(dbenv,
+            listp, TXNLIST_TXNID, txnid, NULL, &elp, 0);
+    
+    if (ret == TXN_NOTFOUND || ret == TXN_IGNORE)
+        return (ret);
+    
+This TXN_IGNORE is defined to 5, which is the rcode that the failing log-
+handler is returning.  __db_txnlist_update has already found the parent
+transaction because of a different child which does not have a begin record.
+In this case, the code chooses to return the status of the transaction
+in the hash.  The calling code unfortunately carefully returns TXN_IGNORE.
+
+The fix is actually simple (and is sprinkled throughout other places of this
+function:
+
+            ret = __db_txnlist_update(dbenv, info,
+                    argp->txnid->txnid, TXN_IGNORE, NULL);
+            fromline = __LINE__;
+            if (ret > 0)
+                ret = 0;
+

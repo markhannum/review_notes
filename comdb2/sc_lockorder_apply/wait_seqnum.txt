@@ -1,0 +1,93 @@
+Studied a SEGV in distributed commit:
+
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0  0x000000000074ea72 in bdb_wait_for_seqnum_from_all_int (bdb_state=0x7fcc33545608, seqnum=0x7fcc0cf036f0, timeoutms=0x2ebcdf4,
+    txnsize=10719, newcoh=1) at ../bdb/rep.c:3241
+3241    ../bdb/rep.c: No such file or directory.
+[Current thread is 1 (Thread 0x7fcc0cf16700 (LWP 23372))]
+(gdb) where
+#0  0x000000000074ea72 in bdb_wait_for_seqnum_from_all_int (bdb_state=0x7fcc33545608, seqnum=0x7fcc0cf036f0, timeoutms=0x2ebcdf4,
+    txnsize=10719, newcoh=1) at ../bdb/rep.c:3241
+#1  0x0000000000750137 in bdb_wait_for_seqnum_from_all_adaptive_newcoh (bdb_state=0x7fcc33545608, seqnum=0x7fcc0cf036f0,
+    txnsize=10719, timeoutms=0x2ebcdf4) at ../bdb/rep.c:3669
+#2  0x00000000004dbfea in trans_wait_for_seqnum_int (bdb_handle=0x7fcc33545608, dbenv=0x25e2a10, iq=0x2ebc498,
+    source_node=0x25b0098 "n3", timeoutms=-1, adaptive=1, ss=0x7fcc0cf036f0) at ../db/glue.c:648
+#3  0x00000000004dc523 in trans_commit_int (iq=0x2ebc498, trans=0x3b24ba8, source_host=0x25b0098 "n3", timeoutms=-1, adaptive=1,
+    logical=0, blkseq=0x0, blklen=0, blkkey=0x0, blkkeylen=0, release_schema_lk=1) at ../db/glue.c:766
+#4  0x00000000004dc6d1 in trans_commit_adaptive (iq=0x2ebc498, trans=0x3b24ba8, source_host=0x25b0098 "n3") at ../db/glue.c:803
+#5  0x00000000006050bb in toblock_main_int (javasp_trans_handle=0x35a56c0, iq=0x2ebc498, p_blkstate=0x7fcc0cf158c0)
+    at ../db/toblock.c:5613
+#6  0x00000000006065b5 in toblock_main (javasp_trans_handle=0x35a56c0, iq=0x2ebc498, p_blkstate=0x7fcc0cf158c0) at ../db/toblock.c:6003
+#7  0x00000000005fb3c5 in toblock_outer (iq=0x2ebc498, blkstate=0x7fcc0cf158c0) at ../db/toblock.c:2241
+#8  0x00000000005fa6d1 in toblock (iq=0x2ebc498) at ../db/toblock.c:1971
+#9  0x0000000000564fe1 in handle_op_block (iq=0x2ebc498) at ../db/sltdbt.c:158
+#10 0x0000000000565741 in handle_ireq (iq=0x2ebc498) at ../db/sltdbt.c:287
+#11 0x00000000004ecd10 in thd_req (vthd=0x2aa2ad8) at ../db/handle_buf.c:484
+#12 0x00007fcc3462d6ba in start_thread (arg=0x7fcc0cf16700) at pthread_create.c:333
+#13 0x00007fcc3436341d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+
+The code which it crashed on is as follows:
+
+    int durable_lsns = bdb_state->attr->durable_lsns;
+
+    (gdb) print bdb_state->attr->durable_lsns
+    $1 = 0
+
+The "punchline" is that this bdb_state object is the CHILD (table-specific) 
+object, and there is another schema-change thread in finalize:
+
+Thread 2 (Thread 0x7fcc0d317700 (LWP 23371)):
+#0  0x00007fcc3462fd47 in __GI___pthread_mutex_lock (mutex=0x264df40) at ../nptl/pthread_mutex_lock.c:67
+#1  0x0000000000782fb3 in time_metric_add (t=0x264df30, value=256) at ../util/perf.c:84
+#2  0x000000000098f3a5 in write_list (netinfo_ptr=0x2669450, host_node_ptr=0x266b088, headptr=0x7fcc0d302990, iov=0x7fcc0d302ae0, iovcount=2, flags=4) at ../net/net.c:637
+#3  0x0000000000990b52 in write_message_int (netinfo_ptr=0x2669450, host_node_ptr=0x266b088, type=5, iov=0x7fcc0d302ae0, iovcount=2, flags=4) at ../net/net.c:1215
+#4  0x0000000000990cab in write_message_checkhello (netinfo_ptr=0x2669450, host_node_ptr=0x266b088, type=5, iov=0x7fcc0d302ae0, iovcount=2, nodelay=0, nodrop=0, inorder=0) at ../net/net.c:1238
+#5  0x0000000000993994 in net_send_int (netinfo_ptr=0x2669450, host=0x25af108 "n1", usertype=1, data=0x7fcc0d302db0, datalen=240, nodelay=0, numtails=0, tails=0x0, taillens=0x0, nodrop=0, inorder=0, trace=0) at ../net/net.c:2117
+#6  0x0000000000993d61 in net_send_flags (netinfo_ptr=0x2669450, host=0x25af108 "n1", usertype=1, data=0x7fcc0d302db0, datalen=240, flags=0) at ../net/net.c:2197
+#7  0x00000000007472ad in berkdb_send_rtn (dbenv=0x269dc80, control=0x7fcc0d3031b0, rec=0x7fcc0d3036b0, lsnp=0x7fcc0d303198, host=0x264e230 ".broadcast", flags=4, usr_ptr=0x0) at ../bdb/rep.c:1060
+#8  0x00000000008c078c in __rep_send_message (dbenv=0x269dc80, eid=0x264e230 ".broadcast", rtype=24, lsnp=0x7fcc0d303360, dbtp=0x7fcc0d3036b0, flags=8, usr_ptr=0x0) at ../berkdb/rep/rep_util.c:242
+#9  0x000000000087718c in __log_put_int_int (dbenv=0x269dc80, lsnp=0x7fcc303a74b0, contextp=0x0, udbt=0x7fcc0d3036b0, flags=8, off_context=-1, usr_ptr=0x0) at ../berkdb/log/log_put.c:346
+#10 0x0000000000877805 in __log_put_int (dbenv=0x269dc80, lsnp=0x7fcc303a74b0, contextp=0x0, udbt=0x7fcc0d3036b0, flags=8, off_context=-1, usr_ptr=0x0) at ../berkdb/log/log_put.c:479
+#11 0x00000000008778e9 in __log_put (dbenv=0x269dc80, lsnp=0x7fcc303a74b0, udbt=0x7fcc0d3036b0, flags=8) at ../berkdb/log/log_put.c:501
+#12 0x00000000008e038c in __db_addrem_log (dbp=0x7fcc10153390, txnid=0x3b20a20, ret_lsnp=0x7fcc303a74b0, flags=0, opcode=2, pgno=3, indx=26, nbytes=124, hdr=0x7fcc0d303790, dbt=0x0, pagelsn=0x7fcc303a74b0) at berkdb/db/db_auto.c:225
+#13 0x0000000000819317 in __db_ditem (dbc=0x7fcc101c9ff8, pagep=0x7fcc303a74b0, indx=26, nbytes=124) at ../berkdb/db/db_dup.c:101
+#14 0x00000000007ee7b8 in __bam_ditem (dbc=0x7fcc101c9ff8, h=0x7fcc303a74b0, indx=26) at ../berkdb/btree/bt_delete.c:173
+#15 0x00000000007edac2 in __bam_c_physdel (dbc=0x7fcc101c9ff8) at ../berkdb/btree/bt_cursor.c:4062
+#16 0x00000000007e5603 in __bam_c_close (dbc=0x7fcc101c9ff8, root_pgno=0, rmroot=0x0) at ../berkdb/btree/bt_cursor.c:1592
+#17 0x00000000007e3b00 in comdb2__bam_c_close (dbc=0x7fcc101c9ff8, root_pgno=0, rmroot=0x0) at ../berkdb/btree/bt_cursor.c:748
+#18 0x0000000000810ab1 in __db_c_close_ll (dbc=0x7fcc101c9ff8, countmein=1) at ../berkdb/db/db_cam.c:131
+#19 0x0000000000810ccb in __db_c_close (dbc=0x7fcc101c9ff8) at ../berkdb/db/db_cam.c:185
+#20 0x000000000080f899 in __db_del (dbp=0x7fcc10153390, txn=0x3b20a20, key=0x7fcc0d303bc0, flags=0) at ../berkdb/db/db_am.c:768
+#21 0x000000000081be8c in __db_del_pp (dbp=0x7fcc10153390, txn=0x3b20a20, key=0x7fcc0d303bc0, flags=0) at ../berkdb/db/db_iface.c:845
+#22 0x0000000000708bbc in bdb_lite_exact_del_int (bdb_state=0x7fcc33652060, tran=0x2b99268, key=0x7fcc0d303c80, bdberr=0x7fcc0d303d24) at ../bdb/lite.c:618
+#23 0x0000000000708c8c in bdb_lite_exact_del (bdb_state=0x7fcc33652060, tran=0x2b99268, key=0x7fcc0d303c80, bdberr=0x7fcc0d303d24) at ../bdb/lite.c:647
+#24 0x0000000000717a2a in bdb_increment_num_sc_done (bdb_state=0x266b460, tran=0x2b99268, bdberr=0x7fcc0d303d24) at ../bdb/llmeta.c:4983
+#25 0x000000000066c981 in mark_schemachange_over_tran (table=0x32bf0c8 "t1", tran=0x2b99268) at ../schemachange/sc_schema.c:373
+#26 0x0000000000657fd1 in do_finalize (func=0x67beb5 <finalize_fastinit_table>, iq=0x2eb7798, s=0x32bf0a0, input_tran=0x2b99268, type=fastinit) at ../schemachange/sc_logic.c:297
+#27 0x0000000000659b9d in finalize_schema_change_thd (iq=0x2eb7798, trans=0x2b99268) at ../schemachange/sc_logic.c:751
+#28 0x0000000000676841 in finalize_schema_change (iq=0x2eb7798, trans=0x2b99268) at ../schemachange/schemachange.c:449
+#29 0x0000000000510a9d in osql_process_packet (iq=0x2eb7798, rqid=1, uuid=0x7fcc0d304610 "_\265ܻ\307\324M\022\252\321&c\266BJ\240p", trans=0x2b99058, pmsg=0x7fcc0d304248, msglen=140, flags=0x7fcc0d30420c, updCols=0x7fcc0d304230, blobs=0x7fcc0d304250, step=2, err=0x7fcc0d304a70, receivedrows=0x7fcc0d304208, logsb=0x0) at ../db/osqlcomm.c:6522
+#30 0x00000000004fd4a5 in process_this_session (iq=0x2eb7798, iq_tran=0x2b99058, sess=0x2d650b8, bdberr=0x7fcc0d3046cc, nops=0x7fcc0d3048d0, err=0x7fcc0d304a70, logsb=0x0, dbc=0x2b99a10, dbc_ins=0x2b997b8, func=0x510590 <osql_process_packet>) at ../db/osqlblockproc.c:1331
+#31 0x00000000004fdb3c in apply_changes (iq=0x2eb7798, tran=0x2fea7c0, iq_tran=0x2b99058, nops=0x7fcc0d3048d0, err=0x7fcc0d304a70, logsb=0x0, func=0x510590 <osql_process_packet>) at ../db/osqlblockproc.c:1449
+#32 0x00000000004fb383 in osql_bplog_commit (iq=0x2eb7798, iq_trans=0x2b99058, nops=0x7fcc0d3048d0, err=0x7fcc0d304a70) at ../db/osqlblockproc.c:426
+#33 0x0000000000602764 in toblock_main_int (javasp_trans_handle=0x32becb8, iq=0x2eb7798, p_blkstate=0x7fcc0d3168c0) at ../db/toblock.c:4772
+#34 0x00000000006065b5 in toblock_main (javasp_trans_handle=0x32becb8, iq=0x2eb7798, p_blkstate=0x7fcc0d3168c0) at ../db/toblock.c:6003
+#35 0x00000000005fb3c5 in toblock_outer (iq=0x2eb7798, blkstate=0x7fcc0d3168c0) at ../db/toblock.c:2241
+#36 0x00000000005fa6d1 in toblock (iq=0x2eb7798) at ../db/toblock.c:1971
+#37 0x0000000000564fe1 in handle_op_block (iq=0x2eb7798) at ../db/sltdbt.c:158
+#38 0x0000000000565741 in handle_ireq (iq=0x2eb7798) at ../db/sltdbt.c:287
+#39 0x00000000004ecd10 in thd_req (vthd=0x2aa2a88) at ../db/handle_buf.c:484
+#40 0x00007fcc3462d6ba in start_thread (arg=0x7fcc0d317700) at pthread_create.c:333
+#41 0x00007fcc3436341d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+
+The bdb_state where we attempt to de-reference the durable lsns attribute is 
+grabbed from trans_commit_int:
+
+    void *bdb_handle = bdb_handle_from_ireq(iq);
+
+This api returns the bdb_handle FOR THE CURRENT USEDB.  As this test explicitly
+does lots of schema-changes, and modifies these handles, the fix is to use the
+parent handle at this point in the code (while we are still holding a table
+lock).  The fixed code is in db/glue.c
+
+    void *bdb_handle = thedb->bdb_env;

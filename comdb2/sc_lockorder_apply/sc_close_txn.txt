@@ -1,0 +1,117 @@
+sc_close_txn is a new tunable that requests that schemachange on the master
+close old files "transactionally".  To understand the need for this, examine
+the following stack-trace which was generated from current master:
+-
+Thread 1 (Thread 0x7fba33caf700 (LWP 609)):
+#0  0x00007fba57f95428 in __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:54
+#1  0x00007fba57f9702a in __GI_abort () at abort.c:89
+#2  0x000000000082c765 in __db_addrem_recover (dbenv=0x166f8a0, dbtp=0x7fba33cadfe0, lsnp=0x7fba33cadf50, op=DB_TXN_FORWARD_ROLL, info=0x0) at ../berkdb/db/db_rec.c:153
+#3  0x000000000081698d in __db_dispatch (dbenv=0x166f8a0, dtab=0x7fba3494a390, dtabsize=182, db=0x7fba33cadfe0, lsnp=0x7fba33cadf50, redo=DB_TXN_FORWARD_ROLL, info=0x3619c78) at ../berkdb/db/db_dispatch.c:679
+#4  0x00000000008471e9 in __db_apprec (dbenv=0x166f8a0, max_lsn=0x7fba5753c100, trunclsn=0x7fba33cae240, update=0, flags=4194304) at ../berkdb/env/env_recover.c:1450
+#5  0x00000000008bc987 in __rep_dorecovery (dbenv=0x166f8a0, lsnp=0x7fba5753c100, trunclsnp=0x7fba33cae240, online=1, undid_schema_change=0x7fba33cae224) at ../berkdb/rep/rep_record.c:6555
+#6  0x00000000008bf5d9 in __rep_verify_match (dbenv=0x166f8a0, rp=0x7fba5753c0f8, savetime=1580242283, online=1) at ../berkdb/rep/rep_record.c:7578
+#7  0x00000000008afb69 in __rep_process_message (dbenv=0x166f8a0, control=0x7fba33cae700, rec=0x7fba33cae6d0, eidp=0x7fba33cae560, ret_lsnp=0x7fba33cae5d0, commit_gen=0x7fba33cae580, online=1) at ../berkdb/rep/rep_record.c:2093
+#8  0x0000000000750e60 in process_berkdb (bdb_state=0x163d080, host=0x15a08c8 "n1", control=0x7fba33cae700, rec=0x7fba33cae6d0) at ../bdb/rep.c:3957
+#9  0x0000000000753ddf in berkdb_receive_rtn_int (ack_handle=0x0, usr_ptr=0x163d080, from_node=0x15a08c8 "n1", usertype=1, dta=0x7fba5753c030, dtalen=244, is_tcp=1 '\001') at ../bdb/rep.c:5175
+#10 0x00000000007541da in berkdb_receive_rtn (ack_handle=0x0, usr_ptr=0x163d080, from_host=0x15a08c8 "n1", usertype=1, dta=0x7fba5753c030, dtalen=244, is_tcp=1 '\001') at ../bdb/rep.c:5271
+#11 0x000000000099996c in process_user_message (netinfo_ptr=0x163b070, host_node_ptr=0x163cca8) at ../net/net.c:3656
+#12 0x000000000099c019 in reader_thread (arg=0x163cca8) at ../net/net.c:4406
+#13 0x00007fba583316ba in start_thread (arg=0x7fba33caf700) at pthread_create.c:333
+#14 0x00007fba5806741d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+-
+The "FAILING" log-record is completely vanilla:
+[3][27487679]__db_addrem: rec: 41 txnid 80000405 prevlsn [0][0]
+	opcode: 1
+	fileid: 3
+	pgno: 1
+	indx: 0
+	nbytes: 12
+	hdr: 
+	dbt: 
+    0:00000002 746F0000                    |....to..        |
+	pagelsn: [0][1]
+
+The code failed attempting to run REC_INTRO when it could not resolve dbreg
+fileid 3.  The logstream itself is completely correct.  Here is the "truncated"
+version of events as described by the logstream:
+-
+DBREG WHICH CLOSES PREVIOUS FILEID 3
+[3][27483272]__dbreg_register: rec: 2 txnid 0 prevlsn [0][0]
+	opcode: 2
+	name: 
+    0:5858582E 74315F30 30303030 30303237  |XXX.t1_000000027|
+   10:34366330 3030302E 64617461 733000    |46c0000.datas0. |
+	uid: 
+    0:BD212A00 00080000 9196305E 89E10032  |.!*.......0^...2|
+   10:00000000                             |....            |
+	fileid: 3
+	ftype: 0x1
+	meta_pgno: 0
+	id: 0x0
+
+DBREG WHICH ADDS FILEID 3 (NEXT LOG RECORD)
+[3][27483379]__dbreg_register: rec: 2 txnid 80000403 prevlsn [3][27483089]
+	opcode: 3
+	name: 
+    0:5858582E 74315F30 30303030 30303237  |XXX.t1_000000027|
+   10:34366330 3030302E 64617461 733000    |46c0000.datas0. |
+	uid: 
+    0:BD212A00 00080000 9196305E 89E10032  |.!*.......0^...2|
+   10:00000000                             |....            |
+	fileid: 3
+	ftype: 0x1
+	meta_pgno: 0
+	id: 0x0
+
+THE LOG RECORD WHICH COMMIT THE OPEN OCCUR DIRECTLY BEFORE THE ADDREM
+[3][27487359]__txn_child: rec: 12 txnid 80000401 prevlsn [3][27487251]
+	child: 0x80000403
+	c_lsn: [3][27487208]
+
+[3][27487399] custom: commit: 10005 txnid 80000401 prevlsn[3][27487359]  prevllsn[3][27475973] tranid bd0700009196305e
+
+[3][27487455]__txn_regop_rowlocks: rec: 15 txnid 80000401 prevlsn [3][27487399]
+	opcode: 1
+	ltranid: bd0700009196305e
+	begin_lsn: [3][27475973]
+	last_commit_lsn: [0][1]
+	context: 6e7402000000
+	timestamp: 1580242577 (tue jan 28 15:16:17 2020, 202001281516.17)
+	generation: 40
+	lflags: 0x00360000 db_txn_logical_begin db_txn_logical_commit db_txn_schema_lock db_txn_logical_gen 
+	locks: 
+		fileid: 71072800000800006995305ee379180000000000 type: page-lock page: 3
+		fileid: 71072800000800006995305ee379180000000000 type: page-lock page: 6
+		fileid: 71072800000800006995305ee379180000000000 type: page-lock page: 2
+		fileid: 71072800000800006995305ee379180000000000 type: page-lock page: 5
+		fileid: 71072800000800006995305ee379180000000000 type: page-lock page: 4
+		fileid: 77072800000800006995305e031b200000000000 type: page-lock page: 3
+		fileid: 0000000000000000000000000000000000000000 type: unknown-lock page: 12660
+	rowlocks: 
+
+FAILING RECORD AGAIN
+[3][27487679]__db_addrem: rec: 41 txnid 80000405 prevlsn [0][0]
+	opcode: 1
+	fileid: 3
+	ufid_fileid:
+    0:00000000 00000000 00000000 00000000  |................|
+   10:00000000                             |....            |
+	pgno: 1
+	indx: 0
+	nbytes: 12
+	hdr: 
+	dbt: 
+    0:00000002 746F0000                    |....to..        |
+	pagelsn: [0][1]
+-
+
+Okay .. fastforward to the punchline.  The dbreg log record which CLOSES the 
+previous file is not done transactionally.  Further, recovery began at a point
+which was SUBSEQUENT to the beginning of the transaction which opens the dbreg,
+but PRIOR to the LSN of the log-record which CLOSES the dbreg.
+
+Because recovery doesn't have the beginning of this transaction, it ignores it
+(and can't possibly roll it back anyway).  Because the close is NOT contained 
+in a transaction, it is executed.
+
+WACKYNESS ENSUES!

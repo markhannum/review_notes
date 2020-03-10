@@ -1,0 +1,131 @@
+This is a current issue, and I do not yet have an understanding or a solution 
+for it.  The sc_truncate_lockorder_generated test ran successfully in a loop for
+three hours last night before finally failing with a core on all nodes.  I first
+describe the MASTER:
+
+MASTER:
+
+(gdb) where
+#0  0x00007f8334a95428 in __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:54
+#1  0x00007f8334a9702a in __GI_abort () at abort.c:89
+#2  0x00000000005f7a9a in do_replay_case (iq=0x1bd8ee8, fstseqnum=0x1bd9544, seqlen=36, num_reqs=4, check_long_trn=0,
+        replay_data=0x68fbd30, replay_data_len=276, line=2797) at ../db/toblock.c:1131
+#3  0x00000000005fcc28 in toblock_main_int (javasp_trans_handle=0x2a30800, iq=0x1bd8ee8, p_blkstate=0x7f83082dd8c0)
+at ../db/toblock.c:2795
+#4  0x00000000006065b7 in toblock_main (javasp_trans_handle=0x2a30800, iq=0x1bd8ee8, p_blkstate=0x7f83082dd8c0) at ../db/toblock.c:6003
+#5  0x00000000005fb3c7 in toblock_outer (iq=0x1bd8ee8, blkstate=0x7f83082dd8c0) at ../db/toblock.c:2241
+#6  0x00000000005fa6d3 in toblock (iq=0x1bd8ee8) at ../db/toblock.c:1971
+#7  0x0000000000564fe3 in handle_op_block (iq=0x1bd8ee8) at ../db/sltdbt.c:158
+#8  0x0000000000565743 in handle_ireq (iq=0x1bd8ee8) at ../db/sltdbt.c:287
+#9  0x00000000004ecd12 in thd_req (vthd=0x16c3158) at ../db/handle_buf.c:484
+#10 0x00007f8334e316ba in start_thread (arg=0x7f83082de700) at pthread_create.c:333
+#11 0x00007f8334b6741d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+
+The accompanying trace on the master:
+2020/01/30 02:05:28 early snapinfo blocksql replay detected
+2020/01/30 02:05:28 [FATAL] do_replay_case:1007 in REPLAY ERROR
+
+Which says that although we are aborting at line 1131, it is because of an error
+seen at line 1007.  The "perplexing" part is that this part of the code SHOULD
+NOT FAIL:
+
+if (fstblk_rspkl.numerrs > 0) {
+    struct block_err err;
+
+    if (!(p_fstblk_buf = (uint8_t *)block_err_get(
+                    &err, p_fstblk_buf, p_fstblk_buf_end))) {
+        blkseq_line = __LINE__;
+        goto replay_error;
+    }
+ ..
+
+Unfortunately, both the fstblk_rspkl and the rspkl structures are out-of-scope 
+at this point in the code.  And although I can see the blkseq key, I cannot find
+it referenced in any of the transaction logs.
+
+I'm choosing not to spend much time on this immediately; instead the strategy is
+to make modifications which will make it easier to analyze the next time it
+occurs.  The first is to widen the scope of the replay unpacking structures to 
+function level (they are currently block-scope within do_replay_case).  Second,
+force a flush_db() call before the abort.
+
+Given the nature of this test, it's worth it to attempt to explicitly exercise
+the blkseq-replay logic for transactions which contain schema-changes.  As this
+
+REPLICANTS:
+This is much more mysterious, and I have even less to go on.  Two of the 
+replicants failed to process an addrem which is seemingly completely valid.
+We'll start with the trace:
+
+Recovery took place well before this event:
+2020/01/30 02:05:26 TRUNCATING to 2:16589497 checkpoint lsn is 2:6926759
+2020/01/30 02:05:26 TRUNCATED TO is 2:16589585
+2020/01/30 02:05:26 __env_openfiles: open files from lsn 2:6926655
+2020/01/30 02:05:26  .. done
+2020/01/30 02:05:26 comdb2_recovery_cleanup starting for [2:16589585] as REPLICANT
+2020/01/30 02:05:26 comdb2_recovery_cleanup complete [2:16589585] rc=0
+2020/01/30 02:05:26 __rep_dorecovery finished truncate, trunclsnp is [2:16589585]
+2020/01/30 02:05:26 comdb2_replicated_truncate starting for [2:16589585] as REPLICANT
+2020/01/30 02:05:26 comdb2_replicated_truncate complete [2:16589585]
+ ..
+This directly preceeds the event:
+2020/01/30 02:05:26 Replicant fastinit-ing table:t2
+2020/01/30 02:05:26 get_sc_to_name line 181 get_schema_change_in_progress returning 0 stopsc is 0
+2020/01/30 02:05:26 open_dbs_int line 4314 get_schema_change_in_progress returning 0 stopsc is 0
+2020/01/30 02:05:26 table t2
+2020/01/30 02:05:26     data files: 00000002117f0000
+2020/01/30 02:05:26     blob files
+2020/01/30 02:05:26     index files
+..
+The event:
+> 2020/01/30 02:05:26 transaction failed at [2][16669071]
+> 2020/01/30 02:05:26 [ERROR] __rep_process_txn_int failed at line 4833 with 2
+> 2020/01/30 02:05:26 Error processing txn [2][16671825]
+> 2020/01/30 02:05:26 PANIC: No such file or directory
+
+Here are the relavent bits of the transaction log:
+
+>> LSN which failed:
+[2][16669071]__db_addrem: rec: 41 txnid 8000005b prevlsn [0][0]
+    opcode: 1
+    fileid: 3
+    pgno: 4
+    indx: 50
+    nbytes: 12
+    hdr:
+    dbt:
+    0:00000002 11C20000                    |........        |
+    pagelsn: [2][16661606]
+
+No such file or directory sounds like a dbreg bug - dbreg fileid 3 is opened 
+in a transaction here:
+
+[2][16658413]__dbreg_register: rec: 2 txnid 80000053 prevlsn [0][0]
+    opcode: 3
+    name:
+    0:5858582E 74305F30 30303030 30303230  |XXX.t0_000000020|
+   10:62336430 3030302E 64617461 733000    |b3d0000.datas0. |
+    uid:
+    0:D3112E00 00080000 3380325E 876CC51C  |........3.2^.l..|
+   10:00000000                             |....            |
+    fileid: 3
+    ftype: 0x1
+    meta_pgno: 0
+    id: 0x0
+..
+[2][16658810]__txn_regop_gen: rec: 16 txnid 80000053 prevlsn [2][16658413]
+    opcode: 1
+    generation: 28
+    context: 0000aa1102000000 0000000211aa0000
+    timestamp: 1580367926 (Thu Jan 30 02:05:26 2020, 202001300205.26)
+    locks:
+
+This is well before the lsn which failed.  The core shows that the dbreg index
+for fileid 3 is actually NULL.
+
+(gdb) print ((DB_LOG *)thedb->bdb_env->dbenv->lg_handle)->dbentry[3]
+$12 = {dbp = 0x0, deleted = 0, pfcnt = 0}
+
+The remedy for this will be to enable a stack at dbreg open and close.  It
+seems indisputable that this dbreg should be open at this point, and 
+understanding why it's not is key to addressing this issue.

@@ -1,0 +1,71 @@
+1
+Prior to R7, comdb2 would allow only a single schemachange to run at a time.
+The fact that a schema-change was ongoing was recorded in a global variable,
+"gbl_schema_change_in_progress".  If a master is downgraded, the code which
+performs the downgrade (bdb_upgrade_downgrade_reopen_wrap) calls 
+wait_for_sc_to_stop, which blocks until gbl_schema_change_in_progress drops to
+0.  If a schema-change takes more than 60 seconds to stop running, then 
+wait_for_sc_to_stop aborts the process.
+
+Under R7, comdb2 provides the ability to execute multiple schema-changes
+concurrently.  Now, rather than just being a flag which says that a 
+schema-change is ongoing, the gbl_schema_change_in_progress variable contains
+the number of schema-changes which are being executed.
+
+This pull request attempts to address issues in various parts of the code where
+gbl_schema_change_in_progress is set to an absolute value (0 or 1).  Setting 
+this to an absolute value from any thread is destructive; it destroys it's 
+facility in maintaining a count of active schema changes.  The setter function,
+set_schema_change_in_progress, gave no consideration to thread-safety.  Even
+worse, while some functions would set gbl_schema_change_in_progress to absolute
+values, others would use "relative" values.  This allows several flavors of
+master hangs.  Here is a straightforward example:
+
+Thread-1 : STARTING SC: INCREMENT SC_IN_PROGRESS : VALUE 1
+Thread-2 : SET SC_IN_PROGRESS TO 0               : VALUE 0
+Thread-1 : COMPLETE SC: DECREMENT SC_IN_PROGRESS : VALUE MAXINT (-1)
+Thread-3 : DOWNGRADE->WAIT_FOR_SC_TO_STOP->ABORT
+
+We solve this by hiding the gbl_schema_change_in_progress variable, and 
+allowing only two operations, "increment_schema_change_in_progress", and
+"decrement_schema_change_in_progress".  Further, the increment and decrement
+functions are called only from a single function, sc_set_running.
+
+There's one more part of this.  When downgrade calls wait_for_sc_to_stop, it
+sets the "stopsc" variable, and more, increment_schema_change_in_progress will
+return with a bad rcode if it sees that the stopsc variable is lit.  Again, 
+the changes here are that we check and set stopsc under lock.
+
+2
+Although we may have multiple schema-changes in-flight at a time, we want to
+enforce that each table only has a single ongoing schema-change.  Further,
+we'd like the total number of schema-changes (gbl_schema_change_in_progress),
+to increment atomically when we mark a table as being "in-schema-change".
+If a table is already being schema-changed, then an attempt from another 
+transaction to schema-change that table should fail, and the sc_in_progress
+counter should remain unchanged.
+
+The current code maintains a hash, sc_tables, that contains a list of the tables
+that are currently being schema-changed.  The routine which modifies this hash
+is sc_set_running.  sc_set_running in turn modifies gbl_sc_change_in_progress.
+The logic here is quite confusing though- a master is allowed to add it to the
+hash, but either a master or replicant can increment sc_in_progress.
+
+The changes here are to simplify: we only every call sc_set_running on the 
+master, and we return a bad rcode if there exists another ongoing schema-change
+against that table, or if the stopsc flag is lit (and increment_sc_in_progress
+fails).
+
+(Review changes in schemachange/sc_global.c starting with set_running)
+
+3
+The code which toggles a table and increments or decrements sc_in_progress
+should be in predictable locations.  There are cases where current master will
+allow a transactional schema-change thread to remove it's own claim on a 
+table, and to decrement sc_in_progress.  This confuses things: it's not 
+immediately obvious whether the responsibility for toggling these will be
+handled directly by the block-processor thread or the schema-change thread
+itself.
+
+(Review changes in start_schema_change_tran- point out the is_osql flag and 
+how it's used for 'set_running' .. review osql_process_packet).

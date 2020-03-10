@@ -1,0 +1,40 @@
+Talk about things more or less "in-order"
+
+Schema-lock.  This work is incomplete but "harmless".  Here is the core idea
+behind it: 
+
+1) I've made changes that allow us to assert that we hold the schema-lk
+2) Several new functions concerning schema_lk
+   (SHOW DIFF OF util/schema_lk.h)
+
+   The I am using assert_wrlock_schema and assert_no_schema_lk
+   assert_wrlock_schema_lk()
+   assert_no_schema_lk()
+
+   These are not yet used, but I left them in because I believe they're useful
+   assert_rdlock_schema_lk()
+   assert_lock_schema_lk()
+
+3) How do we use this?
+   a) If we are ever calling "open_dbs_int", assert that we hold the schema_lk
+      in WRITE mode.  
+      
+   b) We only ever call this function in startup, and in schemachange
+      * SC "already" acquired the schemalk on both replicant and master- the
+        new assert_wrlock logic brought to light cases which called this code
+        while *NOT* holding the schema_lk
+
+        (EXAMPLES HERE)
+        
+      * Adding the required code for startup was trivial
+
+   c) A "better" version of this code would also assert that the caller holds a
+      writelock for the table in question
+
+   d) Also, holding a schema-lk might not be required on the master so long as
+      * The calling code holds a writelock on the table
+      * Any code which accesses a table's bdb_state object holds a readlock
+        on the table
+      
+   e) This can be "future work"
+

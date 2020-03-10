@@ -1,0 +1,92 @@
+Transactions which contain schema-changes are followed by calls to
+osql_scdone_commit_callback or osql_scdone_abort_callback depending on the
+outcome of the transaction.  I added a debug assert early in the development
+cycle:
+
+if (bdb_state->name == (char *)0xffffffffffffffff)
+    abort();
+
+(gdb) where
+#0  0x00007f328bbfe428 in __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:54
+#1  0x00007f328bc0002a in __GI_abort () at abort.c:89
+#2  0x00000000006f45ef in bdb_process_unused_files (bdb_state=0x7f328aeb2608, tran=0x0, bdberr=0x7f326382bca4,
+    powner=0xb16d1d "schemachange", delay=1) at ../bdb/file.c:7879
+#3  0x00000000006f4d66 in bdb_list_unused_files_tran (bdb_state=0x7f328aeb2608, tran=0x0, bdberr=0x7f326382bca4,
+        powner=0xb16d1d "schemachange") at ../bdb/file.c:8019
+#4  0x000000000065318a in sc_del_unused_files_tran (db=0x7f3267ae7d20, tran=0x0) at ../schemachange/sc_callbacks.c:575
+#5  0x0000000000653312 in sc_del_unused_files (db=0x7f3267ae7d20) at ../schemachange/sc_callbacks.c:592
+#6  0x00000000005d7be5 in osql_scdone_commit_callback (iq=0x3284128) at ../db/sqloffload.c:798
+#7  0x00000000005d7dc9 in osql_postcommit_handle (iq=0x3284128) at ../db/sqloffload.c:835
+#8  0x0000000000606561 in toblock_main (javasp_trans_handle=0x4950c78, iq=0x3284128, p_blkstate=0x7f326382c8c0) at ../db/toblock.c:6009
+#9  0x00000000005fb338 in toblock_outer (iq=0x3284128, blkstate=0x7f326382c8c0) at ../db/toblock.c:2241
+#10 0x00000000005fa644 in toblock (iq=0x3284128) at ../db/toblock.c:1971
+#11 0x0000000000564fe1 in handle_op_block (iq=0x3284128) at ../db/sltdbt.c:158
+#12 0x0000000000565741 in handle_ireq (iq=0x3284128) at ../db/sltdbt.c:287
+#13 0x00000000004ecd10 in thd_req (vthd=0x33b0ac8) at ../db/handle_buf.c:484
+#14 0x00007f328bf9a6ba in start_thread (arg=0x7f326382d700) at pthread_create.c:333
+#15 0x00007f328bcd041d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+
+The "punchline" is that osql_scdone_commit_callback->sc_del_unused_files is not
+holding a lock on the table in question, and a different thread in the core is
+actively finalizing a schema-change on the same table:
+
+#0  __log_put_int_int (dbenv=0x2966c80, lsnp=0x7f3287d144b0, contextp=0x0, udbt=0x7f325e4d1680, flags=8, off_context=-1, usr_ptr=0x0)
+at ../berkdb/log/log_put.c:250
+#1  0x0000000000877973 in __log_put_int (dbenv=0x2966c80, lsnp=0x7f3287d144b0, contextp=0x0, udbt=0x7f325e4d1680, flags=8,
+        off_context=-1, usr_ptr=0x0) at ../berkdb/log/log_put.c:479
+#2  0x0000000000877a57 in __log_put (dbenv=0x2966c80, lsnp=0x7f3287d144b0, udbt=0x7f325e4d1680, flags=8) at ../berkdb/log/log_put.c:501
+#3  0x00000000008e040d in __db_addrem_log (dbp=0x7f3267ac0390, txnid=0x84cc7d8, ret_lsnp=0x7f3287d144b0, flags=0, opcode=2, pgno=3,
+        indx=18, nbytes=16, hdr=0x7f325e4d1760, dbt=0x0, pagelsn=0x7f3287d144b0) at berkdb/db/db_auto.c:225
+#4  0x000000000081928a in __db_ditem (dbc=0x7f3267abb320, pagep=0x7f3287d144b0, indx=18, nbytes=16) at ../berkdb/db/db_dup.c:101
+#5  0x00000000007ee72b in __bam_ditem (dbc=0x7f3267abb320, h=0x7f3287d144b0, indx=18) at ../berkdb/btree/bt_delete.c:173
+#6  0x00000000007edac1 in __bam_c_physdel (dbc=0x7f3267abb320) at ../berkdb/btree/bt_cursor.c:4069
+#7  0x00000000007e5576 in __bam_c_close (dbc=0x7f3267abb320, root_pgno=0, rmroot=0x0) at ../berkdb/btree/bt_cursor.c:1592
+#8  0x00000000007e3a73 in comdb2__bam_c_close (dbc=0x7f3267abb320, root_pgno=0, rmroot=0x0) at ../berkdb/btree/bt_cursor.c:748
+#9  0x0000000000810a24 in __db_c_close_ll (dbc=0x7f3267abb320, countmein=1) at ../berkdb/db/db_cam.c:131
+#10 0x0000000000810c3e in __db_c_close (dbc=0x7f3267abb320) at ../berkdb/db/db_cam.c:185
+#11 0x000000000080f80c in __db_del (dbp=0x7f3267ac0390, txn=0x84cc7d8, key=0x7f325e4d1b90, flags=0) at ../berkdb/db/db_am.c:768
+#12 0x000000000081bdff in __db_del_pp (dbp=0x7f3267ac0390, txn=0x84cc7d8, key=0x7f325e4d1b90, flags=0) at ../berkdb/db/db_iface.c:845
+#13 0x0000000000708b2f in bdb_lite_exact_del_int (bdb_state=0x7f328afbf060, tran=0x3647d48, key=0x7f325e4d1c80, bdberr=0x7f325e4d1d24)
+at ../bdb/lite.c:618
+#14 0x0000000000708bff in bdb_lite_exact_del (bdb_state=0x7f328afbf060, tran=0x3647d48, key=0x7f325e4d1c80, bdberr=0x7f325e4d1d24)
+at ../bdb/lite.c:647
+#15 0x000000000071822f in bdb_delete_sc_seed (bdb_state=0x2934460, tran=0x3647d48, tablename=0x5a54480 "t1", bdberr=0x7f325e4d1d24)
+at ../bdb/llmeta.c:5138
+#16 0x000000000066c93d in mark_schemachange_over_tran (table=0x5a54480 "t1", tran=0x3647d48) at ../schemachange/sc_schema.c:378
+#17 0x0000000000657f44 in do_finalize (func=0x67be28 <finalize_fastinit_table>, iq=0x3281aa8, s=0x5a54458, input_tran=0x3647d48,
+        type=fastinit) at ../schemachange/sc_logic.c:297
+#18 0x0000000000659b10 in finalize_schema_change_thd (iq=0x3281aa8, trans=0x3647d48) at ../schemachange/sc_logic.c:751
+#19 0x00000000006767b4 in finalize_schema_change (iq=0x3281aa8, trans=0x3647d48) at ../schemachange/schemachange.c:449
+#20 0x0000000000510a9d in osql_process_packet (iq=0x3281aa8, rqid=1, uuid=0x7f325e4d2610 "r}K\027\345\033Cc\266Wp\240\225H%\342p",
+        trans=0x363ff10, pmsg=0x7f325e4d2248, msglen=140, flags=0x7f325e4d220c, updCols=0x7f325e4d2230, blobs=0x7f325e4d2250, step=2,
+        err=0x7f325e4d2a70, receivedrows=0x7f325e4d2208, logsb=0x0) at ../db/osqlcomm.c:6522
+#21 0x00000000004fd4a5 in process_this_session (iq=0x3281aa8, iq_tran=0x363ff10, sess=0x36222c0, bdberr=0x7f325e4d26cc,
+        nops=0x7f325e4d28d0, err=0x7f325e4d2a70, logsb=0x0, dbc=0x3647f58, dbc_ins=0x363b918, func=0x510590 <osql_process_packet>)
+at ../db/osqlblockproc.c:1331
+#22 0x00000000004fdb3c in apply_changes (iq=0x3281aa8, tran=0x3622548, iq_tran=0x363ff10, nops=0x7f325e4d28d0, err=0x7f325e4d2a70,
+        logsb=0x0, func=0x510590 <osql_process_packet>) at ../db/osqlblockproc.c:1449
+#23 0x00000000004fb383 in osql_bplog_commit (iq=0x3281aa8, iq_trans=0x363ff10, nops=0x7f325e4d28d0, err=0x7f325e4d2a70)
+#24 0x00000000006026d7 in toblock_main_int (javasp_trans_handle=0x298fe60, iq=0x3281aa8, p_blkstate=0x7f325e4e48c0)
+at ../db/toblock.c:4772
+#25 0x0000000000606528 in toblock_main (javasp_trans_handle=0x298fe60, iq=0x3281aa8, p_blkstate=0x7f325e4e48c0) at ../db/toblock.c:6003
+#26 0x00000000005fb338 in toblock_outer (iq=0x3281aa8, blkstate=0x7f325e4e48c0) at ../db/toblock.c:2241
+#27 0x00000000005fa644 in toblock (iq=0x3281aa8) at ../db/toblock.c:1971
+#28 0x0000000000564fe1 in handle_op_block (iq=0x3281aa8) at ../db/sltdbt.c:158
+#29 0x0000000000565741 in handle_ireq (iq=0x3281aa8) at ../db/sltdbt.c:287
+#30 0x00000000004ecd10 in thd_req (vthd=0x33b0b18) at ../db/handle_buf.c:484
+#31 0x00007f328bf9a6ba in start_thread (arg=0x7f325e4e5700) at pthread_create.c:333
+#32 0x00007f328bcd041d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:109
+
+The fix is to introduce a temporary transaction to hold a readlock on the table
+while we run this code:
+
+    tran_type *lock_trans = NULL;
+    if ((rc = trans_start(iq, NULL, &lock_trans)) == 0) {
+        bdb_lock_tablename_read(thedb->bdb_env, iq->sc->tablename, lock_trans);
+        sc_del_unused_files(iq->sc->db);
+        trans_abort(iq, lock_trans);
+    }  else {
+        logmsg(LOGMSG_ERROR, "%s failed to start lock_trans, rc=%d\n",
+                __func__, rc);
+    }
+
